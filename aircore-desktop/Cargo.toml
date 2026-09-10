@@ -12,7 +12,12 @@ rfd = "0.15"
 windows = { version = "0.61", features = [
     "Devices_Bluetooth",
     "Devices_Bluetooth_Advertisement",
+    "Devices_WiFiDirect",
+    "Devices_WiFi",
+    "Devices_Enumeration",
+    "Security_Credentials",
     "Foundation",
+    "Foundation_Collections",
     "Win32_System_Com",
     "Storage_Streams",
 ] }

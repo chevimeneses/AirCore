@@ -15,6 +15,8 @@ mod ble_windows;
 use ble_windows::WindowsBleAdvertiser;
 #[cfg(target_os = "windows")]
 use aircore_core::discovery::BleAdvertiser;
+#[cfg(target_os = "windows")]
+mod hotspot_windows;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
