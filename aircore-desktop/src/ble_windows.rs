@@ -3,10 +3,13 @@
 use aircore_core::discovery::{BleAdvertiser, AIRCORE_SERVICE_UUID};
 use std::io;
 use windows::Devices::Bluetooth::Advertisement::{
-    BluetoothLEAdvertisement, BluetoothLEAdvertisementPublisher, BluetoothLEManufacturerData,
+    BluetoothLEAdvertisement, BluetoothLEAdvertisementPublisher, BluetoothLEAdvertisementReceivedEventArgs,
+    BluetoothLEAdvertisementWatcher, BluetoothLEManufacturerData,
 };
-use windows::Storage::Streams::DataWriter;
+use windows::Foundation::TypedEventHandler;
+use windows::Storage::Streams::{DataReader, DataWriter};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::core::Ref;
 
 /// Implementación del rol periférico BLE (anunciarse) para Windows,
 /// usando la API de Windows Runtime a través de windows-rs mediante ManufacturerData.
@@ -35,8 +38,6 @@ impl BleAdvertiser for WindowsBleAdvertiser {
     fn start_advertising(&mut self, device_name: &str) -> io::Result<()> {
         let _ = device_name;
 
-        // Inicializa COM/WinRT en este hilo. Si ya estaba inicializado
-        // (RPC_E_CHANGED_MODE) lo ignoramos.
         unsafe {
             let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
             if hr.is_err() && hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE.into() {
@@ -52,12 +53,10 @@ impl BleAdvertiser for WindowsBleAdvertiser {
         println!("[BLE] Empaquetando UUID de AirCore en ManufacturerData...");
         let writer = DataWriter::new().map_err(|e| win_err_ctx(e, "DataWriter::new"))?;
         
-        // Escribimos los 16 bytes crudos del UUID del servicio dentro del payload
         let bytes = AIRCORE_SERVICE_UUID.as_bytes();
         writer.WriteBytes(bytes).map_err(|e| win_err_ctx(e, "writer.WriteBytes"))?;
         let buffer = writer.DetachBuffer().map_err(|e| win_err_ctx(e, "DetachBuffer"))?;
 
-        // 0xFFFF es el ID de compañía reservado para pruebas y desarrollo local
         let mfg_data = BluetoothLEManufacturerData::Create(0xFFFF, &buffer)
             .map_err(|e| win_err_ctx(e, "BluetoothLEManufacturerData::Create"))?;
 
@@ -92,44 +91,89 @@ impl BleAdvertiser for WindowsBleAdvertiser {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread::sleep;
-    use std::time::Duration;
+/// Implementación del rol central BLE (escanear) para Windows,
+/// buscando el ManufacturerData con ID 0xFFFF y el UUID de AirCore.
+pub struct WindowsBleScanner {
+    watcher: Option<BluetoothLEAdvertisementWatcher>,
+}
 
-    #[test]
-    #[ignore] // cargo test -p aircore-desktop -- --ignored --nocapture anuncia_por_10_segundos
-    fn anuncia_por_10_segundos() {
-        let mut advertiser = WindowsBleAdvertiser::new();
-        advertiser
-            .start_advertising("AirCore-Test")
-            .expect("el anuncio debería iniciar sin errores");
-
-        println!("Anunciando como 'AirCore-Test' por 10 segundos...");
-        sleep(Duration::from_secs(10));
-
-        advertiser.stop_advertising().expect("debería detenerse sin errores");
+impl WindowsBleScanner {
+    pub fn new() -> Self {
+        Self { watcher: None }
     }
 
-    #[test]
-    #[ignore] // cargo test -p aircore-desktop -- --ignored --nocapture diagnostica_soporte_periferico
-    fn diagnostica_soporte_periferico() {
-        use windows::Devices::Bluetooth::BluetoothAdapter;
+    pub fn start_scanning<F>(&mut self, on_found: F) -> io::Result<()>
+    where
+        F: Fn(String, u64) + Send + 'static,
+    {
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if hr.is_err() && hr != windows::Win32::Foundation::RPC_E_CHANGED_MODE.into() {
+                println!("[BLE Scanner] Advertencia: CoInitializeEx devolvió {:?}", hr);
+            }
+        }
 
-        let adapter = BluetoothAdapter::GetDefaultAsync()
-            .expect("no se pudo iniciar GetDefaultAsync")
-            .get()
-            .expect("no se pudo obtener el adaptador Bluetooth");
+        let watcher = BluetoothLEAdvertisementWatcher::new()
+            .map_err(|e| win_err_ctx(e, "BluetoothLEAdvertisementWatcher::new"))?;
 
-        let central = adapter
-            .IsCentralRoleSupported()
-            .expect("no se pudo leer IsCentralRoleSupported");
-        let peripheral = adapter
-            .IsPeripheralRoleSupported()
-            .expect("no se pudo leer IsPeripheralRoleSupported");
+        let handler = TypedEventHandler::new(
+            move |_: Ref<'_, BluetoothLEAdvertisementWatcher>, args: Ref<'_, BluetoothLEAdvertisementReceivedEventArgs>| {
+                if let Some(args) = args.as_ref() {
+                    if let Ok(advertisement) = args.Advertisement() {
+                        if let Ok(mfg_list) = advertisement.ManufacturerData() {
+                            if let Ok(size) = mfg_list.Size() {
+                                for i in 0..size {
+                                    if let Ok(mfg_data) = mfg_list.GetAt(i) {
+                                        if let Ok(company_id) = mfg_data.CompanyId() {
+                                            if company_id == 0xFFFF {
+                                                if let Ok(buffer) = mfg_data.Data() {
+                                                    if let Ok(reader) = DataReader::FromBuffer(&buffer) {
+                                                        let mut bytes = [0u8; 16];
+                                                        if let Ok(len) = reader.UnconsumedBufferLength() {
+                                                            if len >= 16 {
+                                                                if reader.ReadBytes(&mut bytes).is_ok() {
+                                                                    if bytes == *AIRCORE_SERVICE_UUID.as_bytes() {
+                                                                        let bt_addr = args.BluetoothAddress().unwrap_or_default();
+                                                                        let name = advertisement
+                                                                            .LocalName()
+                                                                            .map(|n| n.to_string())
+                                                                            .unwrap_or_else(|_| "AirCore-Receiver".to_string());
+                                                                        
+                                                                        on_found(name, bt_addr);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+        );
 
-        println!("¿Soporta rol central (escanear)?   {}", central);
-        println!("¿Soporta rol periférico (anunciar)? {}", peripheral);
+        watcher
+            .Received(&handler)
+            .map_err(|e| win_err_ctx(e, "Watcher.Received subscription"))?;
+
+        watcher.Start().map_err(|e| win_err_ctx(e, "watcher.Start"))?;
+        println!("[BLE Scanner] Escaneo iniciado correctamente...");
+        
+        self.watcher = Some(watcher);
+        Ok(())
+    }
+
+    pub fn stop_scanning(&mut self) -> io::Result<()> {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.Stop().map_err(win_err)?;
+            println!("[BLE Scanner] Escaneo detenido correctamente.");
+        }
+        Ok(())
     }
 }

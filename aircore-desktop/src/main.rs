@@ -8,10 +8,21 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
+
 #[cfg(target_os = "windows")]
 mod ble_windows;
+#[cfg(target_os = "windows")]
+use ble_windows::WindowsBleAdvertiser;
+#[cfg(target_os = "windows")]
+use aircore_core::discovery::BleAdvertiser;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct BleDevice {
+    name: String,
+    address: u64,
+}
 
 enum AppEvent {
     IncomingRequest {
@@ -24,6 +35,7 @@ enum AppEvent {
     SenderStatus(String),
     SenderVerificationCode(String),
     ReceiverStatus(String),
+    BleDeviceFound(BleDevice),
 }
 
 struct AirCoreApp {
@@ -38,6 +50,12 @@ struct AirCoreApp {
     receiver_status: String,
     event_rx: Receiver<AppEvent>,
     event_tx: Sender<AppEvent>,
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    ble_advertiser: Option<WindowsBleAdvertiser>,
+    
+    discovered_ble_devices: Vec<BleDevice>,
+    selected_ble_device_index: Option<usize>,
 }
 
 #[derive(PartialEq)]
@@ -62,6 +80,10 @@ impl AirCoreApp {
             receiver_status: "Apagado".to_string(),
             event_rx,
             event_tx,
+            #[cfg(target_os = "windows")]
+            ble_advertiser: None,
+            discovered_ble_devices: Vec::new(),
+            selected_ble_device_index: None,
         }
     }
 
@@ -70,7 +92,31 @@ impl AirCoreApp {
             return;
         }
         self.receiver_listening = true;
-        self.receiver_status = "Iniciando servidor...".to_string();
+        self.receiver_status = "Iniciando servidor y BLE...".to_string();
+
+        #[cfg(target_os = "windows")]
+        {
+            let tx_ble = self.event_tx.clone();
+            thread::spawn(move || {
+                let mut advertiser = WindowsBleAdvertiser::new();
+                match advertiser.start_advertising("AirCore-Receiver") {
+                    Ok(_) => {
+                        let _ = tx_ble.send(AppEvent::ReceiverStatus(
+                            "Escuchando (TCP 5000, UDP 5001) + BLE Activo".to_string(),
+                        ));
+                        loop {
+                            thread::sleep(Duration::from_secs(3600));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx_ble.send(AppEvent::ReceiverStatus(format!(
+                            "Advertencia BLE: No se pudo iniciar la publicidad ({})",
+                            e
+                        )));
+                    }
+                }
+            });
+        }
 
         let tx = self.event_tx.clone();
         thread::spawn(move || {
@@ -171,12 +217,22 @@ impl eframe::App for AirCoreApp {
                 AppEvent::ReceiverStatus(status) => {
                     self.receiver_status = status;
                 }
+                AppEvent::BleDeviceFound(device) => {
+                    if !self.discovered_ble_devices.iter().any(|d| d.address == device.address) {
+                        self.discovered_ble_devices.push(device);
+                    }
+                }
             }
         }
 
-        let incoming_data = self.incoming_request.as_ref().map(|(ip, name, size, code, _)| {
-            (ip.clone(), name.clone(), *size, code.clone())
-        });
+        // Solo procesamos y mostramos la solicitud entrante si la ventana actual está en Modo Receptor
+        let incoming_data = if self.mode == AppMode::Receiver {
+            self.incoming_request.as_ref().map(|(ip, name, size, code, _)| {
+                (ip.clone(), name.clone(), *size, code.clone())
+            })
+        } else {
+            None
+        };
 
         if let Some((peer_ip, file_name, file_size, code)) = incoming_data {
             egui::Window::new("🚨 Solicitud de Archivo Entrante")
@@ -278,31 +334,98 @@ impl eframe::App for AirCoreApp {
                     });
 
                     ui.add_space(10.0);
-                    if ui.button("🔍 Buscar Receptor en la Red (UDP)").clicked() {
-                        self.searching = true;
-                        self.sender_status = "Buscando receptores...".to_string();
-                        let tx = self.event_tx.clone();
-                        let ctx_clone = ctx.clone();
+                    ui.horizontal(|ui| {
+                        if ui.button("🔍 Buscar (UDP)").clicked() {
+                            self.searching = true;
+                            self.sender_status = "Buscando receptores por red...".to_string();
+                            let tx = self.event_tx.clone();
+                            let ctx_clone = ctx.clone();
 
-                        thread::spawn(move || {
-                            if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-                                let _ = socket.set_broadcast(true);
-                                let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
-                                if socket.send_to(b"BUSCANDO_AIR_RECEIVER", "255.255.255.255:5001").is_ok() {
-                                    let mut buf = [0; 1024];
-                                    if let Ok((amt, src)) = socket.recv_from(&mut buf) {
-                                        let resp = String::from_utf8_lossy(&buf[..amt]);
-                                        if resp == "ESTOY_AQUI_AIR_RECEIVER" {
-                                            let ip = src.ip().to_string();
-                                            let _ = tx.send(AppEvent::SenderStatus(format!("IP_DETECTADA:{}", ip)));
-                                            ctx_clone.request_repaint();
-                                            return;
+                            thread::spawn(move || {
+                                if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+                                    let _ = socket.set_broadcast(true);
+                                    let _ = socket.set_read_timeout(Some(Duration::from_secs(3)));
+                                    if socket.send_to(b"BUSCANDO_AIR_RECEIVER", "255.255.255.255:5001").is_ok() {
+                                        let mut buf = [0; 1024];
+                                        if let Ok((amt, src)) = socket.recv_from(&mut buf) {
+                                            let resp = String::from_utf8_lossy(&buf[..amt]);
+                                            if resp == "ESTOY_AQUI_AIR_RECEIVER" {
+                                                let ip = src.ip().to_string();
+                                                let _ = tx.send(AppEvent::SenderStatus(format!("IP_DETECTADA:{}", ip)));
+                                                ctx_clone.request_repaint();
+                                                return;
+                                            }
                                         }
                                     }
                                 }
+                                let _ = tx.send(AppEvent::SenderStatus("No se encontró ningún receptor por red.".to_string()));
+                                ctx_clone.request_repaint();
+                            });
+                        }
+
+                        #[cfg(target_os = "windows")]
+                        {
+                            if ui.button("📶 Buscar BLE").clicked() {
+                                self.sender_status = "Escaneando dispositivos BLE cercanos...".to_string();
+                                self.discovered_ble_devices.clear();
+                                self.selected_ble_device_index = None;
+
+                                let tx = self.event_tx.clone();
+                                let ctx_clone = ctx.clone();
+
+                                thread::spawn(move || {
+                                    use crate::ble_windows::WindowsBleScanner;
+                                    let mut scanner = WindowsBleScanner::new();
+                                    
+                                    let tx_callback = tx.clone();
+                                    let result = scanner.start_scanning(move |name, addr| {
+                                        let _ = tx_callback.send(AppEvent::BleDeviceFound(BleDevice { name, address: addr }));
+                                    });
+
+                                    if result.is_ok() {
+                                        thread::sleep(Duration::from_secs(4));
+                                        let _ = scanner.stop_scanning();
+                                        let _ = tx.send(AppEvent::SenderStatus("Escaneo BLE finalizado.".to_string()));
+                                    } else {
+                                        let _ = tx.send(AppEvent::SenderStatus("Error al iniciar el escáner Bluetooth.".to_string()));
+                                    }
+                                    ctx_clone.request_repaint();
+                                });
                             }
-                            let _ = tx.send(AppEvent::SenderStatus("No se encontró ningún receptor.".to_string()));
-                            ctx_clone.request_repaint();
+                        }
+                    });
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Receptores BLE:");
+                            
+                            let current_text = match self.selected_ble_device_index {
+                                Some(idx) => {
+                                    if let Some(dev) = self.discovered_ble_devices.get(idx) {
+                                        format!("{} ({:#014X})", dev.name, dev.address)
+                                    } else {
+                                        "Seleccionar dispositivo...".to_string()
+                                    }
+                                }
+                                None => {
+                                    if self.discovered_ble_devices.is_empty() {
+                                        "Ninguno encontrado".to_string()
+                                    } else {
+                                        "Seleccionar dispositivo...".to_string()
+                                    }
+                                }
+                            };
+
+                            egui::ComboBox::from_id_salt("ble_devices_combo")
+                                .selected_text(current_text)
+                                .show_ui(ui, |ui| {
+                                    for (i, dev) in self.discovered_ble_devices.iter().enumerate() {
+                                        let label = format!("{} ({:#014X})", dev.name, dev.address);
+                                        let _ = ui.selectable_value(&mut self.selected_ble_device_index, Some(i), label);
+                                    }
+                                });
                         });
                     }
 
