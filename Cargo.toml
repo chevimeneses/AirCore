@@ -1,0 +1,3 @@
+[workspace]
+members = ["aircore-core", "aircore-desktop"]
+resolver = "2"
