@@ -23,14 +23,20 @@ fn win_err_ctx(e: windows::core::Error, context: &str) -> io::Error {
     )
 }
 
+/// Este es el "lado que se conecta" — el que usa el Emisor para
+/// hablarle al servidor GATT del Receptor. Es como un teléfono que
+/// marca a un número específico, en vez de esperar a que le llamen.
 pub struct WindowsGattClient {
-    _device: BluetoothLEDevice, // se mantiene viva mientras dure la conexión
+    _device: BluetoothLEDevice, // El guion bajo al inicio del nombre significa "sé que no lo uso directamente,
+                                 // pero necesito que siga viva mientras dure la conexión" — si se destruyera,
+                                 // Windows podría cerrar la conexión Bluetooth sin avisar.
 }
 
 impl WindowsGattClient {
-    /// Se conecta al dispositivo AirCore en la dirección Bluetooth dada
-    /// (formato u64, tal como lo entrega WindowsBleScanner), y devuelve
-    /// un transporte Noise listo para negociar.
+    /// ⚠️ NUNCA PROBADO EN VIVO (requiere que un WindowsGattServer real
+    /// esté corriendo en otra máquina) — pero la lógica está completa:
+    /// se conecta al dispositivo, encuentra el servicio de AirCore, y
+    /// localiza sus dos características (oferta y credenciales).
     pub fn connect(bluetooth_address: u64) -> io::Result<(Self, BleClientTransport)> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -42,6 +48,9 @@ impl WindowsGattClient {
             .get()
             .map_err(|e| win_err_ctx(e, "FromBluetoothAddressAsync.get()"))?;
 
+        // Le preguntamos al dispositivo "¿tienes el servicio de
+        // AirCore?" — si el otro lado no está corriendo
+        // WindowsGattServer, esto va a fallar aquí mismo.
         println!("[GATT-cliente] Buscando el servicio AirCore...");
         let services_result = device
             .GetGattServicesForUuidAsync(uuid_to_guid(AIRCORE_SERVICE_UUID))
@@ -63,9 +72,12 @@ impl WindowsGattClient {
             .Services()
             .map_err(|e| win_err_ctx(e, "services_result.Services()"))?;
         let service = services
-            .GetAt(0)
+            .GetAt(0) // Nos quedamos con el primero (el otro lado solo debería tener uno).
             .map_err(|e| win_err_ctx(e, "services.GetAt(0) — ¿el Host está anunciando?"))?;
 
+        // Ahora buscamos las dos características específicas dentro
+        // de ese servicio, igual que buscar dos platillos específicos
+        // dentro del menú.
         println!("[GATT-cliente] Buscando característica de oferta (canal saliente)...");
         let offer_result = service
             .GetCharacteristicsForUuidAsync(uuid_to_guid(OFFER_CHARACTERISTIC_UUID))
@@ -90,11 +102,16 @@ impl WindowsGattClient {
             .GetAt(0)
             .map_err(|e| win_err_ctx(e, "cred characteristics.GetAt(0)"))?;
 
-        // El transporte Noise: manda por `offer_char` (write), recibe
-        // los bytes que lleguen por `credentials_char` (notify) a
-        // través del canal, alimentado por el handler de abajo.
+        // Creamos nuestro lado del "traductor" Noise-sobre-BLE. Este
+        // manda escribiendo en offer_char; recibe a través de una
+        // cola que se llena cuando el Host nos notifique algo por
+        // credentials_char (ver el handler justo abajo).
         let (transport, tx) = BleClientTransport::new(offer_char);
 
+        // Código que Windows ejecuta automáticamente cada vez que el
+        // Host cambia el valor de la característica de credenciales
+        // (es decir, cada vez que nos manda una notificación). Su
+        // único trabajo: leer los bytes y avisarle al transporte.
         let handler = TypedEventHandler::new(
             move |_sender, args: windows::core::Ref<'_, GattValueChangedEventArgs>| {
                 if let Some(args) = args.as_ref() {
@@ -112,9 +129,13 @@ impl WindowsGattClient {
             },
         );
         credentials_char
-            .ValueChanged(&handler)
+            .ValueChanged(&handler) // "Avísame cada vez que cambie este valor".
             .map_err(|e| win_err_ctx(e, "credentials_char.ValueChanged"))?;
 
+        // Suscribirse al handler de arriba NO BASTA — también hay que
+        // avisarle explícitamente al dispositivo remoto (el Host) "sí
+        // quiero que me mandes notificaciones de esto". Esto es un
+        // paso extra que exige el protocolo Bluetooth mismo.
         let sub_status = credentials_char
             .WriteClientCharacteristicConfigurationDescriptorAsync(
                 GattClientCharacteristicConfigurationDescriptorValue::Notify,
@@ -135,9 +156,13 @@ impl WindowsGattClient {
     }
 }
 
-/// Realiza el handshake Noise, manda la oferta, y bloquea hasta
-/// recibir la respuesta del Host (aceptación con credenciales, o
-/// rechazo).
+/// ⚠️ NUNCA PROBADO EN VIVO — hace tres cosas en secuencia, cada una
+/// bloqueando hasta terminar:
+/// 1. El handshake Noise (usando el MISMO código que ya funciona
+///    perfecto sobre TCP, solo que ahora corre sobre Bluetooth).
+/// 2. Manda la oferta (nombre + tamaño del archivo), ya cifrada.
+/// 3. Espera la respuesta del Host: o trae las credenciales del
+///    hotspot (aceptó), o dice que rechazó.
 pub fn negotiate(
     transport: BleClientTransport,
     file_name: &str,

@@ -5,44 +5,64 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-/// UUID de servicio propio de AirCore. Cualquier UUID único sirve;
-/// este es fijo para que todos los dispositivos AirCore se reconozcan
-/// entre sí durante el escaneo BLE. (Placeholder — se puede regenerar
-/// más adelante, lo único que importa es que sea el mismo en todos
-/// los dispositivos que corran esta app).
+// Este es el "código secreto" que usan todos los dispositivos AirCore
+// para reconocerse entre sí durante un escaneo BLE — como una frase
+// clave que solo entienden los dispositivos que corren esta app. No
+// importa si otras apps la ven; simplemente la ignorarán porque no la
+// reconocen.
 pub const AIRCORE_SERVICE_UUID: Uuid = Uuid::from_u128(0x8a51ec228f744d2e9e299f1e2b9d5c31);
 
-/// Un dispositivo AirCore descubierto por BLE.
+/// Representa un dispositivo AirCore que encontramos mientras
+/// escaneábamos por Bluetooth — solo guarda datos, no hace nada por
+/// sí solo.
 #[derive(Debug, Clone)]
 pub struct DiscoveredPeer {
     pub name: String,
     pub address: String,
-    pub signal_strength: Option<i16>, // RSSI, si está disponible
+    pub signal_strength: Option<i16>, // RSSI: qué tan fuerte se oye la señal (más cercano a 0 = más cerca).
 }
 
-/// Anuncia este dispositivo como receptor disponible (rol periférico BLE).
-/// Todavía sin implementación real — viene en el siguiente paso, y sí
-/// va a requerir código específico por sistema operativo.
+// ⚠️ Los siguientes tres "traits" son solo CONTRATOS — como una receta
+// que dice "cualquier implementación de esto debe saber hacer tal
+// cosa", pero sin decir CÓMO. Son el plano de diseño; la
+// implementación real de cada uno vive en archivos específicos de
+// Windows (ble_windows.rs, hotspot_windows.rs), porque cada sistema
+// operativo tiene su propia forma de hacer estas cosas.
+
+/// Contrato: "anunciarse por Bluetooth para que otros te encuentren".
+/// NO tiene implementación aquí — hoy solo lo cumple WindowsGattServer
+/// en aircore-desktop, indirectamente (usa su propio mecanismo, no
+/// implementa este trait literalmente, pero cumple el mismo propósito).
 pub trait BleAdvertiser: Send {
     fn start_advertising(&mut self, device_name: &str) -> io::Result<()>;
     fn stop_advertising(&mut self) -> io::Result<()>;
 }
 
-/// Busca dispositivos AirCore cercanos (rol central BLE).
+/// Contrato: "buscar dispositivos AirCore cercanos por Bluetooth".
 pub trait BleScanner: Send {
     fn scan(&mut self, timeout_secs: u64) -> io::Result<Vec<DiscoveredPeer>>;
 }
 
-/// Crea y destruye un hotspot Wi-Fi temporal.
+/// Contrato: "crear/destruir un Wi-Fi temporal, y poder unirse a uno".
+/// Implementado de verdad en hotspot_windows.rs (WindowsHotspotManager).
 pub trait HotspotManager: Send {
     fn start_hotspot(&mut self, ssid: &str, password: &str) -> io::Result<String>;
     fn stop_hotspot(&mut self) -> io::Result<()>;
     fn join_network(&mut self, ssid: &str, password: &str) -> io::Result<()>;
 }
 
-/// Implementación real de BleScanner usando btleplug. Soporta el rol
-/// central en Windows, macOS, Linux y Android, así que vive aquí en
-/// el core y se reutiliza tal cual en todas las plataformas.
+/// ✅ ESTA SÍ es una implementación real y funcional (no solo un
+/// contrato) — usa la librería "btleplug", que funciona igual en
+/// Windows, macOS, Linux y Android. Es la única pieza de todo BLE que
+/// no depende de código específico de un sistema operativo.
+///
+/// NOTA IMPORTANTE: aunque esta implementación existe y funciona
+/// (fue probada escaneando dispositivos Bluetooth reales), main.rs
+/// NO la está usando hoy — en su lugar usa WindowsBleScanner (nativo
+/// de Windows) para la búsqueda real desde la interfaz. Esta clase se
+/// queda aquí como la opción "multiplataforma" para el día que se
+/// quiera portar el proyecto a Linux/macOS/Android, donde la versión
+/// nativa de Windows no compilaría.
 pub struct BtleplugScanner;
 
 impl BtleplugScanner {
@@ -50,23 +70,27 @@ impl BtleplugScanner {
         Self
     }
 
-    /// Escanea CUALQUIER dispositivo BLE cercano, sin filtrar por el
-    /// servicio de AirCore. Sirve solo para validar que el hardware/stack
-    /// Bluetooth de esta máquina funciona, antes de tener un Advertiser
-    /// real que anuncie el servicio propio de AirCore.
+    /// Escanea CUALQUIER dispositivo BLE cercano (celulares, audífonos,
+    /// lo que sea), sin filtrar por el UUID de AirCore. Sirve para
+    /// confirmar que el Bluetooth de la máquina funciona en general.
     pub fn scan_any(&mut self, timeout_secs: u64) -> io::Result<Vec<DiscoveredPeer>> {
+        // btleplug funciona de forma "asíncrona" (async), pero el
+        // resto de nuestro proyecto trabaja de forma normal/síncrona.
+        // Este Runtime es el "traductor" que permite llamar código
+        // async desde código normal, esperando a que termine antes de
+        // seguir (block_on = "bloquéate aquí hasta que esto acabe").
         let rt = Runtime::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         rt.block_on(async {
             let manager = Manager::new().await.map_err(ble_err)?;
-            let adapters = manager.adapters().await.map_err(ble_err)?;
+            let adapters = manager.adapters().await.map_err(ble_err)?; // Los "radios" Bluetooth de esta PC.
             let central = adapters.into_iter().next().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "No se encontró ningún adaptador Bluetooth")
-            })?;
+            })?; // Usamos el primero que haya (normalmente solo hay uno).
 
-            central.start_scan(ScanFilter::default()).await.map_err(ble_err)?;
-            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            central.start_scan(ScanFilter::default()).await.map_err(ble_err)?; // Empieza a escuchar el aire.
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await; // Espera el tiempo pedido.
 
-            let peripherals = central.peripherals().await.map_err(ble_err)?;
+            let peripherals = central.peripherals().await.map_err(ble_err)?; // Todo lo que se detectó.
             let mut result = Vec::new();
             for p in peripherals {
                 if let Ok(Some(props)) = p.properties().await {
@@ -77,16 +101,21 @@ impl BtleplugScanner {
                     });
                 }
             }
-            let _ = central.stop_scan().await;
+            let _ = central.stop_scan().await; // Apaga el escaneo, ya terminamos.
             Ok(result)
         })
     }
 }
 
+// Esto es lo que hace que BtleplugScanner "cumpla" oficialmente el
+// contrato BleScanner de arriba.
 impl BleScanner for BtleplugScanner {
     fn scan(&mut self, timeout_secs: u64) -> io::Result<Vec<DiscoveredPeer>> {
-        // Por ahora idéntico a scan_any. En cuanto exista un Advertiser
-        // real, aquí se filtra por AIRCORE_SERVICE_UUID.
+        // Por ahora es idéntico a scan_any (sin filtrar). El día que
+        // se quiera usar esta clase de verdad en la app, aquí se
+        // agregaría un filtro para solo devolver dispositivos que
+        // anuncien AIRCORE_SERVICE_UUID, en vez de traer TODO lo que
+        // haya cerca (celulares, audífonos, refrigeradores, etc).
         self.scan_any(timeout_secs)
     }
 }
@@ -95,6 +124,10 @@ fn ble_err(e: btleplug::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, format!("Error BLE: {:?}", e))
 }
 
+// Prueba manual (no corre automáticamente, por el #[ignore]) que ya
+// se usó para confirmar que el escaneo BLE funciona de verdad en la
+// laptop de desarrollo — encontró 17 dispositivos reales la primera
+// vez que se corrió.
 #[cfg(test)]
 mod tests {
     use super::*;
