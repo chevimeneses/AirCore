@@ -1,4 +1,5 @@
 use aircore_core::crypto::{perform_handshake_initiator, perform_handshake_responder, SecureChannel, MAX_FRAME_LEN};
+use aircore_core::discovery::HotspotManager;
 use aircore_core::transfer::{decode_metadata, encode_metadata, recv_file, send_file, MAX_FILE_SIZE};
 use eframe::egui;
 use rfd::FileDialog;
@@ -12,13 +13,105 @@ use std::time::Duration;
 #[cfg(target_os = "windows")]
 mod ble_windows;
 #[cfg(target_os = "windows")]
-use ble_windows::WindowsBleAdvertiser;
-#[cfg(target_os = "windows")]
-use aircore_core::discovery::BleAdvertiser;
-#[cfg(target_os = "windows")]
 mod hotspot_windows;
+#[cfg(target_os = "windows")]
+mod gatt_server_windows;
+#[cfg(target_os = "windows")]
+mod gatt_client_windows;
+#[cfg(target_os = "windows")]
+mod ble_transport_windows;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Escaneo UDP bloqueante: reutilizado tanto por el botón manual como
+/// por el flujo mediado por BLE, una vez que el Guest ya se unió al
+/// hotspot y necesita encontrar la IP del Host en esa red nueva.
+fn discover_receiver_ip(timeout: Duration) -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.set_broadcast(true).ok()?;
+    socket.set_read_timeout(Some(timeout)).ok()?;
+    socket.send_to(b"BUSCANDO_AIR_RECEIVER", "255.255.255.255:5001").ok()?;
+    let mut buf = [0u8; 1024];
+    let (amt, src) = socket.recv_from(&mut buf).ok()?;
+    let resp = String::from_utf8_lossy(&buf[..amt]);
+    if resp == "ESTOY_AQUI_AIR_RECEIVER" {
+        Some(src.ip().to_string())
+    } else {
+        None
+    }
+}
+
+/// Genera SSID + contraseña para el hotspot temporal. NOTA: no es un
+/// generador criptográficamente seguro — placeholder consciente, ya
+/// anotado en la lista de endurecimiento pendiente (usar OsRng).
+#[cfg(target_os = "windows")]
+fn generate_hotspot_credentials() -> (String, String) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seed = now.as_nanos() as u64 ^ (std::process::id() as u64).rotate_left(32);
+    let ssid = format!("AirCore-{:06X}", (seed & 0xFFFFFF) as u32);
+    let password = format!("{:016X}", seed);
+    (ssid, password)
+}
+
+/// Lógica de transferencia TCP+Noise, compartida entre el flujo manual
+/// (IP escrita a mano) y el flujo mediado por BLE (IP descubierta tras
+/// unirse al hotspot) — es la capa "Transfer" de la arquitectura,
+/// reutilizada sin importar cómo se llegó a la conexión.
+fn run_tcp_transfer(ip: String, file_path: String, tx: Sender<AppEvent>, ctx: egui::Context) {
+    let result = (|| -> io::Result<()> {
+        let mut file = File::open(&file_path)?;
+        let file_size = file.metadata()?.len();
+        let addr = format!("{}:5000", ip);
+
+        let _ = tx.send(AppEvent::SenderStatus(format!("Conectando a {}...", addr)));
+        ctx.request_repaint();
+
+        let stream = TcpStream::connect(&addr)?;
+        stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(READ_TIMEOUT))?;
+
+        let _ = tx.send(AppEvent::SenderStatus("Estableciendo canal cifrado...".to_string()));
+        ctx.request_repaint();
+
+        let mut channel = perform_handshake_initiator(stream)?;
+        let code = channel.verification_code();
+
+        let _ = tx.send(AppEvent::SenderVerificationCode(code));
+        ctx.request_repaint();
+
+        let _ = tx.send(AppEvent::SenderStatus("Esperando aprobación del receptor...".to_string()));
+        ctx.request_repaint();
+
+        let file_name_only = std::path::Path::new(&file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archivo_recibido".to_string());
+
+        channel.send(&encode_metadata(&file_name_only, file_size))?;
+
+        let approval = channel.recv(64)?;
+        if approval.first() != Some(&1) {
+            let _ = tx.send(AppEvent::SenderStatus("El receptor rechazó la transferencia.".to_string()));
+            ctx.request_repaint();
+            return Ok(());
+        }
+
+        let _ = tx.send(AppEvent::SenderStatus("¡Aceptado! Transmitiendo datos...".to_string()));
+        ctx.request_repaint();
+
+        send_file(&mut channel, &mut file)?;
+
+        let _ = tx.send(AppEvent::SenderStatus("¡Transferencia completada con éxito!".to_string()));
+        ctx.request_repaint();
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = tx.send(AppEvent::SenderStatus(format!("Error: {}", e)));
+        ctx.request_repaint();
+    }
+}
 
 #[derive(Clone)]
 struct BleDevice {
@@ -38,6 +131,14 @@ enum AppEvent {
     SenderVerificationCode(String),
     ReceiverStatus(String),
     BleDeviceFound(BleDevice),
+    /// Llegó una oferta por BLE. `decision_tx` es cómo la GUI le avisa
+    /// al hilo de fondo qué decidió el usuario: Some((ssid,password))
+    /// si aceptó (y ya arrancó el hotspot), None si rechazó.
+    BleOfferReceived {
+        name: String,
+        size: u64,
+        decision_tx: Sender<Option<(String, String)>>,
+    },
 }
 
 struct AirCoreApp {
@@ -52,12 +153,12 @@ struct AirCoreApp {
     receiver_status: String,
     event_rx: Receiver<AppEvent>,
     event_tx: Sender<AppEvent>,
-    #[cfg(target_os = "windows")]
-    #[allow(dead_code)]
-    ble_advertiser: Option<WindowsBleAdvertiser>,
-    
+
     discovered_ble_devices: Vec<BleDevice>,
     selected_ble_device_index: Option<usize>,
+
+    /// Oferta BLE pendiente de que el usuario acepte o rechace.
+    ble_offer: Option<(String, u64, Sender<Option<(String, String)>>)>,
 }
 
 #[derive(PartialEq)]
@@ -82,10 +183,9 @@ impl AirCoreApp {
             receiver_status: "Apagado".to_string(),
             event_rx,
             event_tx,
-            #[cfg(target_os = "windows")]
-            ble_advertiser: None,
             discovered_ble_devices: Vec::new(),
             selected_ble_device_index: None,
+            ble_offer: None,
         }
     }
 
@@ -100,19 +200,56 @@ impl AirCoreApp {
         {
             let tx_ble = self.event_tx.clone();
             thread::spawn(move || {
-                let mut advertiser = WindowsBleAdvertiser::new();
-                match advertiser.start_advertising("AirCore-Receiver") {
-                    Ok(_) => {
+                use crate::gatt_server_windows::WindowsGattServer;
+
+                match WindowsGattServer::start() {
+                    Ok((server, transport)) => {
                         let _ = tx_ble.send(AppEvent::ReceiverStatus(
-                            "Escuchando (TCP 5000, UDP 5001) + BLE Activo".to_string(),
+                            "Escuchando (TCP 5000, UDP 5001) + BLE listo para una oferta...".to_string(),
                         ));
-                        loop {
-                            thread::sleep(Duration::from_secs(3600));
+
+                        match crate::gatt_server_windows::accept_offer(transport) {
+                            Ok((mut channel, name, size)) => {
+                                let (decision_tx, decision_rx) =
+                                    mpsc::channel::<Option<(String, String)>>();
+
+                                let _ = tx_ble.send(AppEvent::BleOfferReceived {
+                                    name,
+                                    size,
+                                    decision_tx,
+                                });
+
+                                match decision_rx.recv() {
+                                    Ok(Some((ssid, password))) => {
+                                        let _ = crate::gatt_server_windows::respond(
+                                            &mut channel,
+                                            crate::ble_transport_windows::HotspotResponse::Accepted {
+                                                ssid,
+                                                password,
+                                            },
+                                        );
+                                    }
+                                    _ => {
+                                        let _ = crate::gatt_server_windows::respond(
+                                            &mut channel,
+                                            crate::ble_transport_windows::HotspotResponse::Rejected,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx_ble.send(AppEvent::ReceiverStatus(format!(
+                                    "No se completó ninguna negociación Bluetooth: {}",
+                                    e
+                                )));
+                            }
                         }
+
+                        let _ = server.stop();
                     }
                     Err(e) => {
                         let _ = tx_ble.send(AppEvent::ReceiverStatus(format!(
-                            "Advertencia BLE: No se pudo iniciar la publicidad ({})",
+                            "Advertencia: no se pudo iniciar el servidor Bluetooth ({})",
                             e
                         )));
                     }
@@ -224,10 +361,14 @@ impl eframe::App for AirCoreApp {
                         self.discovered_ble_devices.push(device);
                     }
                 }
+                AppEvent::BleOfferReceived { name, size, decision_tx } => {
+                    self.ble_offer = Some((name, size, decision_tx));
+                }
             }
         }
 
-        // Solo procesamos y mostramos la solicitud entrante si la ventana actual está en Modo Receptor
+        // Ventana de solicitud vía TCP+Noise directo (flujo manual o
+        // ya conectado tras un hotspot BLE) — sin cambios de comportamiento.
         let incoming_data = if self.mode == AppMode::Receiver {
             self.incoming_request.as_ref().map(|(ip, name, size, code, _)| {
                 (ip.clone(), name.clone(), *size, code.clone())
@@ -299,6 +440,74 @@ impl eframe::App for AirCoreApp {
                         }
                     });
                 });
+        }
+
+        // Ventana nueva: solicitud llegada por Bluetooth (Fase 2 del
+        // protocolo) — antes de que exista ningún hotspot o conexión TCP.
+        if self.mode == AppMode::Receiver {
+            let ble_data = self.ble_offer.as_ref().map(|(name, size, _)| (name.clone(), *size));
+
+            if let Some((name, size)) = ble_data {
+                egui::Window::new("🔵 Solicitud vía Bluetooth")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, -140.0])
+                    .show(ctx, |ui| {
+                        ui.heading("Un dispositivo cercano quiere enviarte un archivo");
+                        ui.separator();
+                        ui.label(format!("📁 Archivo: '{}'", name));
+                        ui.label(format!("📦 Tamaño: {} bytes", size));
+                        ui.label("Al aceptar, se creará una red Wi-Fi temporal para la transferencia.");
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            if ui.button("❌ Rechazar").clicked() {
+                                if let Some((_, _, decision_tx)) = self.ble_offer.take() {
+                                    let _ = decision_tx.send(None);
+                                }
+                                self.receiver_status = "Solicitud Bluetooth rechazada.".to_string();
+                            }
+                            if ui.button("✅ Aceptar").clicked() {
+                                if let Some((_, _, decision_tx)) = self.ble_offer.take() {
+                                    let tx = self.event_tx.clone();
+                                    let ctx_clone = ctx.clone();
+
+                                    #[cfg(target_os = "windows")]
+                                    thread::spawn(move || {
+                                        let (ssid, password) = generate_hotspot_credentials();
+                                        let mut manager = crate::hotspot_windows::WindowsHotspotManager::new();
+
+                                        match manager.start_hotspot(&ssid, &password) {
+                                            Ok(_) => {
+                                                let _ = decision_tx.send(Some((ssid.clone(), password.clone())));
+                                                let _ = tx.send(AppEvent::ReceiverStatus(format!(
+                                                    "Hotspot '{}' activo. Esperando a que el emisor se conecte...",
+                                                    ssid
+                                                )));
+                                                ctx_clone.request_repaint();
+
+                                                // Red de seguridad: si nadie más lo detiene antes,
+                                                // el hotspot se apaga solo tras 10 minutos.
+                                                thread::sleep(Duration::from_secs(600));
+                                                let _ = manager.stop_hotspot();
+                                            }
+                                            Err(e) => {
+                                                let _ = decision_tx.send(None);
+                                                let _ = tx.send(AppEvent::ReceiverStatus(format!(
+                                                    "No se pudo crear el hotspot: {}",
+                                                    e
+                                                )));
+                                                ctx_clone.request_repaint();
+                                            }
+                                        }
+                                    });
+
+                                    self.receiver_status = "Creando hotspot temporal...".to_string();
+                                }
+                            }
+                        });
+                    });
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -378,7 +587,7 @@ impl eframe::App for AirCoreApp {
                                 thread::spawn(move || {
                                     use crate::ble_windows::WindowsBleScanner;
                                     let mut scanner = WindowsBleScanner::new();
-                                    
+
                                     let tx_callback = tx.clone();
                                     let result = scanner.start_scanning(move |name, addr| {
                                         let _ = tx_callback.send(AppEvent::BleDeviceFound(BleDevice { name, address: addr }));
@@ -402,7 +611,7 @@ impl eframe::App for AirCoreApp {
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.label("Receptores BLE:");
-                            
+
                             let current_text = match self.selected_ble_device_index {
                                 Some(idx) => {
                                     if let Some(dev) = self.discovered_ble_devices.get(idx) {
@@ -428,6 +637,10 @@ impl eframe::App for AirCoreApp {
                                         let _ = ui.selectable_value(&mut self.selected_ble_device_index, Some(i), label);
                                     }
                                 });
+
+                            if self.selected_ble_device_index.is_some() && ui.button("✖ Usar IP manual").clicked() {
+                                self.selected_ble_device_index = None;
+                            }
                         });
                     }
 
@@ -440,8 +653,95 @@ impl eframe::App for AirCoreApp {
                     ui.add_space(15.0);
                     if ui.button("🚀 Enviar Archivo").clicked() {
                         if let Some(ref file_path) = self.selected_file {
-                            if self.target_ip.is_empty() {
-                                self.sender_status = "Por favor ingresa o busca una IP válida.".to_string();
+                            #[cfg(target_os = "windows")]
+                            let ble_selected = self.selected_ble_device_index.and_then(|idx| {
+                                self.discovered_ble_devices.get(idx).cloned()
+                            });
+                            #[cfg(not(target_os = "windows"))]
+                            let ble_selected: Option<BleDevice> = None;
+
+                            if let Some(device) = ble_selected {
+                                self.sender_verification_code = None;
+                                let path_clone = file_path.clone();
+                                let tx = self.event_tx.clone();
+                                let ctx_clone = ctx.clone();
+
+                                #[cfg(target_os = "windows")]
+                                thread::spawn(move || {
+                                    let result = (|| -> io::Result<()> {
+                                        let file_name_only = std::path::Path::new(&path_clone)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "archivo_recibido".to_string());
+                                        let file_size = std::fs::metadata(&path_clone)?.len();
+
+                                        let _ = tx.send(AppEvent::SenderStatus(format!(
+                                            "Conectando por Bluetooth a '{}'...",
+                                            device.name
+                                        )));
+                                        ctx_clone.request_repaint();
+
+                                        let (_client, transport) =
+                                            crate::gatt_client_windows::WindowsGattClient::connect(device.address)?;
+
+                                        let _ = tx.send(AppEvent::SenderStatus(
+                                            "Negociando con el receptor por Bluetooth...".to_string(),
+                                        ));
+                                        ctx_clone.request_repaint();
+
+                                        let response = crate::gatt_client_windows::negotiate(
+                                            transport,
+                                            &file_name_only,
+                                            file_size,
+                                        )?;
+
+                                        match response {
+                                            crate::ble_transport_windows::HotspotResponse::Rejected => {
+                                                let _ = tx.send(AppEvent::SenderStatus(
+                                                    "El receptor rechazó la solicitud (Bluetooth).".to_string(),
+                                                ));
+                                                ctx_clone.request_repaint();
+                                            }
+                                            crate::ble_transport_windows::HotspotResponse::Accepted {
+                                                ssid,
+                                                password,
+                                            } => {
+                                                let _ = tx.send(AppEvent::SenderStatus(format!(
+                                                    "Aceptado. Uniéndose a la red '{}'... (perderás tu conexión actual)",
+                                                    ssid
+                                                )));
+                                                ctx_clone.request_repaint();
+
+                                                let mut manager =
+                                                    crate::hotspot_windows::WindowsHotspotManager::new();
+                                                manager.join_network(&ssid, &password)?;
+
+                                                let _ = tx.send(AppEvent::SenderStatus(
+                                                    "Conectado. Buscando al receptor en la red temporal...".to_string(),
+                                                ));
+                                                ctx_clone.request_repaint();
+
+                                                let ip = discover_receiver_ip(Duration::from_secs(8)).ok_or_else(|| {
+                                                    io::Error::new(
+                                                        io::ErrorKind::NotFound,
+                                                        "no se encontró al receptor en la red del hotspot",
+                                                    )
+                                                })?;
+
+                                                run_tcp_transfer(ip, path_clone.clone(), tx.clone(), ctx_clone.clone());
+                                            }
+                                        }
+                                        Ok(())
+                                    })();
+
+                                    if let Err(e) = result {
+                                        let _ = tx.send(AppEvent::SenderStatus(format!("Error (Bluetooth): {}", e)));
+                                        ctx_clone.request_repaint();
+                                    }
+                                });
+                            } else if self.target_ip.is_empty() {
+                                self.sender_status =
+                                    "Ingresa una IP, búscala por red, o selecciona un dispositivo BLE.".to_string();
                             } else {
                                 self.sender_verification_code = None;
                                 let path_clone = file_path.clone();
@@ -449,60 +749,7 @@ impl eframe::App for AirCoreApp {
                                 let tx = self.event_tx.clone();
                                 let ctx_clone = ctx.clone();
 
-                                thread::spawn(move || {
-                                    let result = (|| -> io::Result<()> {
-                                        let mut file = File::open(&path_clone)?;
-                                        let file_size = file.metadata()?.len();
-                                        let addr = format!("{}:5000", ip_clone);
-
-                                        let _ = tx.send(AppEvent::SenderStatus(format!("Conectando a {}...", addr)));
-                                        ctx_clone.request_repaint();
-
-                                        let stream = TcpStream::connect(&addr)?;
-                                        stream.set_read_timeout(Some(READ_TIMEOUT))?;
-                                        stream.set_write_timeout(Some(READ_TIMEOUT))?;
-
-                                        let _ = tx.send(AppEvent::SenderStatus("Estableciendo canal cifrado...".to_string()));
-                                        ctx_clone.request_repaint();
-
-                                        let mut channel = perform_handshake_initiator(stream)?;
-                                        let code = channel.verification_code();
-
-                                        let _ = tx.send(AppEvent::SenderVerificationCode(code));
-                                        ctx_clone.request_repaint();
-
-                                        let _ = tx.send(AppEvent::SenderStatus("Esperando aprobación del receptor...".to_string()));
-                                        ctx_clone.request_repaint();
-
-                                        let file_name_only = std::path::Path::new(&path_clone)
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| "archivo_recibido".to_string());
-
-                                        channel.send(&encode_metadata(&file_name_only, file_size))?;
-
-                                        let approval = channel.recv(64)?;
-                                        if approval.first() != Some(&1) {
-                                            let _ = tx.send(AppEvent::SenderStatus("El receptor rechazó la transferencia.".to_string()));
-                                            ctx_clone.request_repaint();
-                                            return Ok(());
-                                        }
-
-                                        let _ = tx.send(AppEvent::SenderStatus("¡Aceptado! Transmitiendo datos...".to_string()));
-                                        ctx_clone.request_repaint();
-
-                                        send_file(&mut channel, &mut file)?;
-
-                                        let _ = tx.send(AppEvent::SenderStatus("¡Transferencia completada con éxito!".to_string()));
-                                        ctx_clone.request_repaint();
-                                        Ok(())
-                                    })();
-
-                                    if let Err(e) = result {
-                                        let _ = tx.send(AppEvent::SenderStatus(format!("Error: {}", e)));
-                                        ctx_clone.request_repaint();
-                                    }
-                                });
+                                thread::spawn(move || run_tcp_transfer(ip_clone, path_clone, tx, ctx_clone));
                             }
                         } else {
                             self.sender_status = "Selecciona un archivo primero.".to_string();

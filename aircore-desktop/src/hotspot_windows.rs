@@ -1,4 +1,5 @@
 #![cfg(target_os = "windows")]
+#![allow(dead_code)]
 
 use aircore_core::discovery::HotspotManager;
 use std::io;
@@ -108,7 +109,7 @@ impl HotspotManager for WindowsHotspotManager {
     }
 
         fn join_network(&mut self, ssid: &str, password: &str) -> io::Result<()> {
-        use windows::Devices::Wifi::{WiFiAccessStatus, WiFiAdapter, WiFiReconnectionKind};
+        use windows::Devices::WiFi::{WiFiAccessStatus, WiFiAdapter, WiFiReconnectionKind};
         use windows::Security::Credentials::PasswordCredential;
 
         unsafe {
@@ -179,8 +180,8 @@ impl HotspotManager for WindowsHotspotManager {
 
         println!("[WiFi] Conectando a '{}'...", ssid);
         let result = adapter
-            .ConnectAsync(&network, WiFiReconnectionKind::Automatic, &credential)
-            .map_err(|e| win_err_ctx(e, "adapter.ConnectAsync"))?
+            .ConnectWithPasswordCredentialAsync(&network, WiFiReconnectionKind::Automatic, &credential)
+            .map_err(|e| win_err_ctx(e, "adapter.ConnectWithPasswordCredentialAsync"))?
             .get()
             .map_err(|e| win_err_ctx(e, "ConnectAsync.get()"))?;
 
@@ -196,8 +197,6 @@ impl HotspotManager for WindowsHotspotManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
-    use std::time::Duration;
 
     #[test]
     #[ignore] // cargo test -p aircore-desktop -- --ignored --nocapture crea_hotspot
@@ -211,8 +210,10 @@ mod tests {
         }
         result.expect("el hotspot debería arrancar sin errores");
 
-        println!("[Hotspot] Activo por 20 segundos — revisa en tu celular si aparece la red 'AirCore-Test-Hotspot'...");
-        sleep(Duration::from_secs(20));
+        println!("[Hotspot] Activo. Ve a la otra laptop y corre la prueba de unión.");
+        println!("[Hotspot] Presiona ENTER aquí cuando termines para detener el hotspot...");
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).ok();
 
         manager.stop_hotspot().expect("debería detenerse sin errores");
         println!("[Hotspot] Detenido.");

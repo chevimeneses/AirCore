@@ -182,6 +182,7 @@ dependencies = [
  "aircore-core",
  "eframe",
  "rfd",
+ "uuid",
  "windows 0.61.3",
 ]
 
