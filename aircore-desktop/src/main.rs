@@ -937,13 +937,18 @@ impl eframe::App for AirCoreApp {
 // El punto de entrada de todo el programa — lo primero que se ejecuta
 // al abrir la app.
 fn main() -> Result<(), eframe::Error> {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("no se pudo cargar el ícono de la ventana");
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 400.0]), // Tamaño inicial de la ventana.
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([500.0, 400.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(
-        "AirCore - Interfaz Gráfica", // Título de la ventana.
+        "AirCore - Interfaz Gráfica",
         options,
-        Box::new(|cc| Ok(Box::new(AirCoreApp::new(cc)))), // Crea la app y la deja correr.
+        Box::new(|cc| Ok(Box::new(AirCoreApp::new(cc)))),
     )
 }
